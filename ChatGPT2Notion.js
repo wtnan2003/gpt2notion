@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ChatGPT → Notion（保留公式｜支持数据库父级）
+// @name         ChatGPT → Notion（保留公式｜数据库支持｜修复列表与代码语言｜按钮置底不显设置）
 // @namespace    https://github.com/wtnan2003/gpt2notion
-// @version      1.1.0
-// @description  将 ChatGPT/ChatGPT 新域名（chatgpt.com）里的回答，一键复制为 Markdown 或推送到 Notion，并保留 LaTeX 公式（$...$ 与 $$...$$）。支持父级为 Page 或 Database，并能从完整链接中自动提取并规范化 Notion ID。
+// @version      1.2.0
+// @description  将 ChatGPT 回答复制/推送到 Notion，并保留 LaTeX；支持父级为 Page/Database；自动修正代码语言别名；避免列表空圆点；按钮位于回答底部且隐藏设置按钮（通过 Tampermonkey 菜单打开设置）。
 // @author       you
 // @match        https://chat.openai.com/*
 // @match        https://chatgpt.com/*
@@ -32,14 +32,10 @@
   function normalizeNotionId(input) {
     if (!input) return '';
     let s = String(input).trim();
-    // 去掉查询/锚点
     s = s.split('?')[0].split('#')[0];
-    // 若是完整 URL，取 pathname
     try { const u = new URL(s); s = u.pathname; } catch (e) {}
-    // 优先匹配带连字符的 UUID
     const hy = s.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
     if (hy) return hy[0].toLowerCase();
-    // 再匹配 32 位无连字符的 UUID
     const pl = s.match(/[0-9a-f]{32}/i);
     if (pl) {
       const p = pl[0].toLowerCase();
@@ -51,10 +47,10 @@
   function getConfig() {
     return {
       token: GM_getValue('notion_token', ''),
-      parentIdRaw: GM_getValue('notion_parent_id', ''), // 允许粘贴完整链接
+      parentIdRaw: GM_getValue('notion_parent_id', ''),
       parentIsDatabase: GM_getValue('notion_parent_is_database', false),
       preferCreateNewPage: GM_getValue('notion_prefer_create_page', true),
-      appendTargetIdRaw: GM_getValue('notion_append_target_id', ''), // 允许粘贴完整链接
+      appendTargetIdRaw: GM_getValue('notion_append_target_id', ''),
     };
   }
 
@@ -80,9 +76,9 @@
     setTimeout(() => (div.style.display = 'none'), 3000);
   }
 
-  // ===== 样式 =====
+  // ===== 样式：按钮置底；隐藏设置按钮（仅保留复制与推送） =====
   GM_addStyle(`
-    .tm-export-bar { position: sticky; top: 8px; z-index: 1000; display: flex; gap: 8px; }
+    .tm-export-bar { position: static; margin-top: 8px; z-index: 1000; display: flex; gap: 8px; }
     .tm-btn { cursor: pointer; padding: 6px 10px; border-radius: 8px; border: 1px solid #ddd; background: #fafafa; font-size: 12px; }
     .tm-btn:hover { background: #f0f0f0; }
     .tm-toast { position: fixed; right: 16px; bottom: 16px; padding: 10px 14px; border-radius: 10px; color: #fff; background: rgba(0,0,0,0.7); font-size: 13px; }
@@ -131,7 +127,7 @@
     const parentId = normalizeNotionId(cfg.parentIdRaw);
     const appendId = normalizeNotionId(cfg.appendTargetIdRaw);
 
-    if (!parentId && !appendId) throw new Error('未配置 Notion 目标：请在设置中填写父页面/数据库 ID，或填写要追加的页面/块 ID');
+    if (!parentId && !appendId) throw new Error('未配置 Notion 目标：请填写父页面/数据库 ID，或要追加的页面/块 ID');
 
     if (cfg.preferCreateNewPage) {
       if (!parentId) throw new Error('未配置父级 ID（页面或数据库）');
@@ -139,7 +135,7 @@
       const payload = {
         parent,
         properties: cfg.parentIsDatabase
-          ? undefined // 若是数据库，属性由数据库模板/默认值决定；可在此扩展
+          ? undefined
           : { title: { title: [{ type: 'text', text: { content: title } }] } },
         children,
       };
@@ -147,10 +143,8 @@
       return page;
     } else {
       if (!appendId) throw new Error('未配置“追加到页面/块 ID”');
-      // 不能向数据库 block 追加
-      // （若用户不小心填了数据库 ID，会在这里给出更友好的错误）
       const res = await notionRequest({ method: 'PATCH', url: `/blocks/${appendId}/children`, data: { children } }).catch(e => {
-        if (/database/i.test(String(e))) throw new Error('“追加到”目标看起来像是数据库 ID，Notion 不支持向数据库直接追加块。请改用“创建新页面”并把父级设置为该数据库。');
+        if (/database/i.test(String(e))) throw new Error('“追加到”目标看起来像数据库 ID。请改用“创建新页面”并将父级设置为该数据库。');
         throw e;
       });
       return res;
@@ -179,7 +173,7 @@
 
     const btnCopy = document.createElement('button');
     btnCopy.className = 'tm-btn';
-    btnCopy.textContent = '📋 复制为 Markdown（保留公式）';
+    btnCopy.textContent = '📋 copyMarkdown';
     btnCopy.addEventListener('click', async () => {
       try {
         const md = serializeToMarkdown(msgNode);
@@ -193,7 +187,7 @@
 
     const btnNotion = document.createElement('button');
     btnNotion.className = 'tm-btn';
-    btnNotion.textContent = '🧭 推送到 Notion（保留公式）';
+    btnNotion.textContent = '🧭 sendNotion';
     btnNotion.addEventListener('click', async () => {
       try {
         const blocks = serializeToNotionBlocks(msgNode);
@@ -209,17 +203,13 @@
       }
     });
 
-    const btnCfg = document.createElement('button');
-    btnCfg.className = 'tm-btn';
-    btnCfg.textContent = '⚙️ Notion 设置';
-    btnCfg.addEventListener('click', openConfigPanel);
-
+    // 仅保留两个按钮（隐藏设置按钮）
     bar.appendChild(btnCopy);
     bar.appendChild(btnNotion);
-    bar.appendChild(btnCfg);
 
+    // 插入位置：回答的最底端
     const target = msgNode.querySelector('.markdown')?.parentElement || msgNode;
-    target.insertBefore(bar, target.firstChild);
+    target.appendChild(bar);
   }
 
   function openConfigPanel() {
@@ -246,9 +236,8 @@
         <button id="tm-notion-close" class="tm-btn">关闭</button>
       </div>
       <div style="font-size:12px;color:#666;margin-top:8px;line-height:1.4;">
-        提示：
-        1) 请在 Notion「设置 → 集成」创建 Internal Integration，并把父页面/数据库 <b>Share → Invite</b> 给该集成；
-        2) 若看到 “page_id should be a valid uuid / ?v=...”，说明粘的是数据库视图链接或带查询参数，已支持自动提取，无需手工删改；
+        提示：1) 在 Notion「设置 → 集成」创建 Internal Integration，并把父页面/数据库 <b>Share → Invite</b> 给该集成；
+        2) 可直接粘贴带 <code>?v=</code> 的数据库视图链接，我会自动提取 ID；
         3) 想把内容作为条目进数据库，请勾选“父级是数据库”。
       </div>
     `;
@@ -266,7 +255,10 @@
     };
   }
 
-  // ====== 序列化为 Markdown（保留 $ 与 $$） ======
+  // 菜单入口（隐藏设置按钮时仍可从这里打开）
+  GM_registerMenuCommand('Notion 设置', openConfigPanel);
+
+  // ====== 复制为 Markdown（保留 $ 与 $$） ======
   function serializeToMarkdown(msgNode) {
     const mdLines = [];
     const root = msgNode.querySelector('.markdown') || msgNode;
@@ -328,8 +320,8 @@
         const code = el.querySelector('code');
         const lang = Array.from(code?.classList || []).find(c => c.startsWith('language-'))?.replace('language-', '') || '';
         const txt = code ? code.textContent : el.textContent;
-        mdLines.push('```' + lang);
-        mdLines.push(txt.replace(/\n$/, ''));
+        mdLines.push('```' + (lang || ''));
+        mdLines.push((txt || '').replace(/\n$/, ''));
         mdLines.push('```');
         mdLines.push('');
         return;
@@ -338,7 +330,7 @@
         const ordered = tag === 'OL';
         Array.from(el.children).forEach((li, i) => {
           const line = (ordered ? (i + 1) + '. ' : '- ') + textFromNode(li);
-          mdLines.push(line);
+        mdLines.push(line);
         });
         mdLines.push('');
         return;
@@ -362,10 +354,49 @@
     return mdLines.join('\n').replace(/\n{3,}/g, '\n\n');
   }
 
+  // ====== Notion 语言映射 ======
+  function mapToNotionLang(lang) {
+    if (!lang) return 'plain text';
+    const l = String(lang).toLowerCase();
+    const alias = {
+      js: 'javascript', node: 'javascript', mjs: 'javascript', cjs: 'javascript',
+      ts: 'typescript',
+      py: 'python',
+      rb: 'ruby',
+      kt: 'kotlin',
+      rs: 'rust',
+      sh: 'shell', zsh: 'shell', bash: 'bash',
+      ps: 'powershell', ps1: 'powershell',
+      cs: 'c#', csharp: 'c#',
+      cpp: 'c++', cplusplus: 'c++',
+      objc: 'objective-c', objectivec: 'objective-c',
+      tex: 'latex',
+      md: 'markdown',
+      yml: 'yaml',
+      json5: 'json',
+      dockerfile: 'docker',
+      make: 'makefile',
+      m: 'matlab',
+      txt: 'plain text', text: 'plain text', plaintext: 'plain text',
+    };
+    if (alias[l]) return alias[l];
+    const allowed = new Set([
+      'abap','abc','agda','arduino','ascii art','assembly','bash','basic','bnf','c','c#','c++',
+      'clojure','coffeescript','coq','css','dart','dhall','diff','docker','ebnf','elixir','elm',
+      'erlang','f#','flow','fortran','gherkin','glsl','go','graphql','groovy','haskell','hcl',
+      'html','idris','java','javascript','json','julia','kotlin','latex','less','lisp','livescript',
+      'llvm ir','lua','makefile','markdown','markup','matlab','mathematica','mermaid','nix',
+      'notion formula','objective-c','ocaml','pascal','perl','php','plain text','powershell',
+      'prolog','protobuf','purescript','python','r','racket','reason','ruby','rust','sass','scala',
+      'scheme','scss','shell','smalltalk','solidity','sql','swift','toml','typescript','vb.net',
+      'verilog','vhdl','visual basic','webassembly','xml','yaml','java/c/c++/c#'
+    ]);
+    return allowed.has(l) ? l : 'plain text';
+  }
+
   // ====== 序列化为 Notion Blocks（保留 inline/display 公式） ======
   function serializeToNotionBlocks(msgNode) {
     const root = msgNode.querySelector('.markdown') || msgNode;
-
     const blocks = [];
 
     function rtText(content, annotations = {}, link = null) {
@@ -440,62 +471,58 @@
 
     function pushCode(el) {
       const code = el.querySelector('code');
-      const lang = Array.from(code?.classList || []).find(c => c.startsWith('language-'))?.replace('language-', '') || 'plain text';
+      let lang = '';
+      if (code) {
+        const cls = Array.from(code.classList || []);
+        const fromClass = cls.find(c => c.startsWith('language-'))?.replace('language-', '');
+        const dataLang = code.getAttribute('data-language') || el.getAttribute('data-language');
+        lang = fromClass || dataLang || '';
+      }
+      lang = mapToNotionLang(lang) || 'plain text';
+
       const txt = code ? code.textContent : el.textContent;
       blocks.push({ type: 'code', code: { language: lang, rich_text: [rtText(txt)] } });
     }
 
-      function pushList(el, ordered = false) {
-          const items = Array.from(el.children).filter(li => li.tagName === 'LI');
+    function pushList(el, ordered = false) {
+      const items = Array.from(el.children).filter(li => li.tagName === 'LI');
 
-          function isEmptyRich(rich) {
-              if (!rich || !rich.length) return true;
-              // 去掉空格、零宽空格等后判空
-              return rich.every(r =>
-                                r.type === 'text' &&
-                                (!r.text?.content || r.text.content.replace(/[\s\u200B-\u200D\uFEFF\u00A0]/g,'') === '')
-                               );
-          }
-          function compactRich(rich) {
-              if (!rich) return rich;
-              return rich
-                  .map(r => {
-                  if (r.type === 'text') {
-                      const t = (r.text?.content || '').replace(/[\u200B-\u200D\uFEFF]/g,'');
-                      return { ...r, text: { ...r.text, content: t.replace(/\s+/g, ' ') } };
-                  }
-                  return r;
-              })
-                  .filter(r => !(r.type === 'text' && (!r.text?.content || r.text.content.trim() === '')));
-          }
-
-          items.forEach(li => {
-              // 若列表项里只有“展示公式”，让公式作为该列表项的子块，而不是单独顶层块
-              const displayKatex = li.querySelector(':scope > .katex-display');
-              const onlyDisplay = displayKatex && li.textContent.trim() === displayKatex.textContent.trim();
-              const key = ordered ? 'numbered_list_item' : 'bulleted_list_item';
-
-              if (onlyDisplay) {
-                  const tex = (function getLatexFromKatex(el) {
-                      const ann = el.querySelector('annotation[encoding="application/x-tex"]');
-                      return ann ? ann.textContent : '';
-                  })(displayKatex);
-                  blocks.push({
-                      type: key,
-                      [key]: { rich_text: [{ type: 'text', text: { content: '' } }] },
-                      children: [{ type: 'equation', equation: { expression: tex } }]
-                  });
-                  return;
-              }
-
-              // 普通列表项：提取富文本 → 清洗 → 判空，空项直接跳过（避免“空圆点”）
-              let rich = parseInline(li);
-              rich = compactRich(rich);
-              if (isEmptyRich(rich)) return;
-
-              blocks.push({ type: key, [key]: { rich_text: rich } });
-          });
+      function isEmptyRich(rich) {
+        if (!rich || !rich.length) return true;
+        return rich.every(r => r.type === 'text' && (!r.text?.content || r.text.content.replace(/[\s\u200B-\u200D\uFEFF\u00A0]/g,'') === ''));
       }
+      function compactRich(rich) {
+        if (!rich) return rich;
+        return rich
+          .map(r => {
+            if (r.type === 'text') {
+              const t = (r.text?.content || '').replace(/[\u200B-\u200D\uFEFF]/g,'');
+              return { ...r, text: { ...r.text, content: t.replace(/\s+/g, ' ') } };
+            }
+            return r;
+          })
+          .filter(r => !(r.type === 'text' && (!r.text?.content || r.text.content.trim() === '')));
+      }
+
+      items.forEach(li => {
+        const displayKatex = li.querySelector(':scope > .katex-display');
+        const onlyDisplay = displayKatex && li.textContent.trim() === displayKatex.textContent.trim();
+        const key = ordered ? 'numbered_list_item' : 'bulleted_list_item';
+        if (onlyDisplay) {
+          const tex = getLatexFromKatex(displayKatex);
+          blocks.push({
+            type: key,
+            [key]: { rich_text: [rtText('')] },
+            children: [{ type: 'equation', equation: { expression: tex } }]
+          });
+          return;
+        }
+        let rich = parseInline(li);
+        rich = compactRich(rich);
+        if (isEmptyRich(rich)) return; // 跳过空列表项
+        blocks.push({ type: key, [key]: { rich_text: rich } });
+      });
+    }
 
     function pushQuote(el) { const rich = parseInline(el); blocks.push({ type: 'quote', quote: { rich_text: rich } }); }
 
@@ -559,9 +586,8 @@
     obs.observe(document.body, { childList: true, subtree: true });
   }
 
-  GM_registerMenuCommand('Notion 设置', openConfigPanel);
-
   (async function init() {
+    GM_registerMenuCommand('Notion 设置', openConfigPanel);
     for (let i = 0; i < 50; i++) {
       if (getAssistantMessageNodes().length) break;
       await sleep(200);
