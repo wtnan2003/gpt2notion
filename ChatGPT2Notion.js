@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT → Notion（保留公式｜数据库支持｜修复列表与代码语言｜按钮置底不显设置）
 // @namespace    https://github.com/wtnan2003/gpt2notion
-// @version      1.2.0
+// @version      1.2.1
 // @description  将 ChatGPT 回答复制/推送到 Notion，并保留 LaTeX；支持父级为 Page/Database；自动修正代码语言别名；避免列表空圆点；按钮位于回答底部且隐藏设置按钮（通过 Tampermonkey 菜单打开设置）。
 // @author       you
 // @match        https://chat.openai.com/*
@@ -403,10 +403,10 @@
       return { type: 'text', text: { content, link: link ? { url: link } : null }, annotations: {
         bold: !!annotations.bold,
         italic: !!annotations.italic,
-        strikethrough: !!annotations.strike,
+        strikethrough: !!annotations.strikethrough,
         underline: !!annotations.underline,
         code: !!annotations.code,
-        color: 'default'
+        color: annotations.color || 'default'
       } };
     }
 
@@ -417,59 +417,150 @@
       return ann ? ann.textContent : '';
     }
 
-    function pushParagraphRich(rich_text) {
+    function pushParagraphRich(rich_text, target = blocks) {
       if (!rich_text || rich_text.length === 0) rich_text = [rtText('')];
-      blocks.push({ type: 'paragraph', paragraph: { rich_text } });
+      target.push({ object: 'block', type: 'paragraph', paragraph: { rich_text } });
     }
 
     function parseInline(node, inherited = {}) {
       const out = [];
-      function appendText(txt, ann = {}, link = null) {
-        if (!txt) return;
-        const last = out[out.length - 1];
-        if (last && last.type === 'text') {
-          const same = (a,b) => JSON.stringify(a)===JSON.stringify(b);
-          const cur = { bold:!!(inherited.bold||ann.bold), italic:!!(inherited.italic||ann.italic), strikethrough:!!(inherited.strike||ann.strike), underline:!!(inherited.underline||ann.underline), code:!!(inherited.code||ann.code), link:link||null };
-          const lst = { bold:!!last.annotations?.bold, italic:!!last.annotations?.italic, strikethrough:!!last.annotations?.strikethrough, underline:!!last.annotations?.underline, code:!!last.annotations?.code, link:last.text?.link?.url||null };
-          if (same(cur,lst)) { last.text.content += txt; return; }
-        }
-        out.push(rtText(txt, { ...inherited, ...ann }, link));
+
+      function normalizeState(state) {
+        return {
+          bold: !!state.bold,
+          italic: !!state.italic,
+          strikethrough: !!state.strikethrough || !!state.strike,
+          underline: !!state.underline,
+          code: !!state.code,
+          link: state.link || null,
+          color: state.color || 'default',
+        };
       }
 
-      function walk(n, inh = inherited) {
-        if (n.nodeType === Node.TEXT_NODE) { appendText(n.nodeValue); return; }
+      function sameStyle(a, b) {
+        return a.bold === b.bold &&
+          a.italic === b.italic &&
+          a.strikethrough === b.strikethrough &&
+          a.underline === b.underline &&
+          a.code === b.code &&
+          a.color === b.color &&
+          a.link === b.link;
+      }
+
+      function appendText(txt, state) {
+        if (!txt) return;
+        const norm = normalizeState(state);
+        const last = out[out.length - 1];
+        if (last && last.type === 'text') {
+          const lastState = {
+            bold: !!last.annotations?.bold,
+            italic: !!last.annotations?.italic,
+            strikethrough: !!last.annotations?.strikethrough,
+            underline: !!last.annotations?.underline,
+            code: !!last.annotations?.code,
+            link: last.text?.link?.url || null,
+            color: last.annotations?.color || 'default',
+          };
+          if (sameStyle(norm, lastState)) {
+            last.text.content += txt;
+            return;
+          }
+        }
+        const notionAnn = {
+          bold: norm.bold,
+          italic: norm.italic,
+          strikethrough: norm.strikethrough,
+          underline: norm.underline,
+          code: norm.code,
+          color: norm.color,
+        };
+        out.push(rtText(txt, notionAnn, norm.link));
+      }
+
+      function applyStyledAnnotations(el, state) {
+        let next = state;
+        try {
+          const win = el.ownerDocument && el.ownerDocument.defaultView;
+          if (win) {
+            const cs = win.getComputedStyle(el);
+            if (cs) {
+              const bold = cs.fontWeight && (!isNaN(Number(cs.fontWeight)) ? Number(cs.fontWeight) >= 600 : /bold/i.test(cs.fontWeight));
+              const italic = cs.fontStyle && cs.fontStyle !== 'normal';
+              const deco = cs.textDecorationLine || cs.textDecoration || '';
+              const underline = /underline/i.test(deco);
+              const strike = /line-through/i.test(deco);
+              if (bold || italic || underline || strike) next = { ...next };
+              if (bold) next.bold = true;
+              if (italic) next.italic = true;
+              if (underline) next.underline = true;
+              if (strike) next.strikethrough = true;
+            }
+          }
+        } catch (e) { /* ignore compute style errors */ }
+        return next;
+      }
+
+      function walk(n, state = inherited) {
+        if (!n) return;
+        if (n.nodeType === Node.TEXT_NODE) {
+          appendText(n.nodeValue, state);
+          return;
+        }
         if (n.nodeType !== Node.ELEMENT_NODE) return;
         const el = /** @type {HTMLElement} */(n);
 
         if (el.matches('span.katex, .katex')) { out.push(rtEq(getLatexFromKatex(el))); return; }
+
         const tag = el.tagName;
-        if (tag === 'BR') { appendText('\n'); return; }
-        if (tag === 'CODE' && el.parentElement && el.parentElement.tagName !== 'PRE') { Array.from(el.childNodes).forEach(c => walk(c, { ...inh, code: true })); return; }
-        if (tag === 'STRONG' || tag === 'B') { Array.from(el.childNodes).forEach(c => walk(c, { ...inh, bold: true })); return; }
-        if (tag === 'EM' || tag === 'I') { Array.from(el.childNodes).forEach(c => walk(c, { ...inh, italic: true })); return; }
-        if (tag === 'S' || tag === 'DEL') { Array.from(el.childNodes).forEach(c => walk(c, { ...inh, strike: true })); return; }
-        if (tag === 'U') { Array.from(el.childNodes).forEach(c => walk(c, { ...inh, underline: true })); return; }
-        if (tag === 'A') {
-          const href = el.getAttribute('href');
-          Array.from(el.childNodes).forEach(c => {
-            if (c.nodeType === Node.TEXT_NODE) appendText(c.nodeValue, {}, href);
-            else walk(c, inh);
-          });
+        if (tag === 'BR') { appendText('\n', state); return; }
+        if (tag === 'CODE' && el.parentElement && el.parentElement.tagName !== 'PRE') {
+          Array.from(el.childNodes).forEach(c => walk(c, { ...state, code: true }));
           return;
         }
-        Array.from(el.childNodes).forEach(c => walk(c, inh));
+        if (tag === 'STRONG' || tag === 'B') {
+          Array.from(el.childNodes).forEach(c => walk(c, { ...state, bold: true }));
+          return;
+        }
+        if (tag === 'EM' || tag === 'I') {
+          Array.from(el.childNodes).forEach(c => walk(c, { ...state, italic: true }));
+          return;
+        }
+        if (tag === 'S' || tag === 'DEL') {
+          Array.from(el.childNodes).forEach(c => walk(c, { ...state, strikethrough: true }));
+          return;
+        }
+        if (tag === 'U' || tag === 'INS') {
+          Array.from(el.childNodes).forEach(c => walk(c, { ...state, underline: true }));
+          return;
+        }
+        if (tag === 'MARK') {
+          Array.from(el.childNodes).forEach(c => walk(c, { ...state, color: 'yellow_background' }));
+          return;
+        }
+        if (tag === 'A') {
+          const href = el.getAttribute('href') || null;
+          Array.from(el.childNodes).forEach(c => walk(c, { ...state, link: href }));
+          return;
+        }
+
+        if (tag === 'UL' || tag === 'OL') {
+          return;
+        }
+
+        const nextState = applyStyledAnnotations(el, state);
+        Array.from(el.childNodes).forEach(c => walk(c, nextState));
       }
 
       walk(node, inherited);
       return out;
     }
 
-    function pushHeading(level, el) {
+    function pushHeading(level, el, target = blocks) {
       const rich = parseInline(el);
-      blocks.push({ [`type`]: `heading_${level}`, [`heading_${level}`]: { rich_text: rich } });
+      target.push({ object: 'block', [`type`]: `heading_${level}`, [`heading_${level}`]: { rich_text: rich } });
     }
 
-    function pushCode(el) {
+    function pushCode(el, target = blocks) {
       const code = el.querySelector('code');
       let lang = '';
       if (code) {
@@ -481,10 +572,10 @@
       lang = mapToNotionLang(lang) || 'plain text';
 
       const txt = code ? code.textContent : el.textContent;
-      blocks.push({ type: 'code', code: { language: lang, rich_text: [rtText(txt)] } });
+      target.push({ object: 'block', type: 'code', code: { language: lang, rich_text: [rtText(txt)] } });
     }
 
-    function pushList(el, ordered = false) {
+    function pushList(el, ordered = false, target = blocks) {
       const items = Array.from(el.children).filter(li => li.tagName === 'LI');
 
       function isEmptyRich(rich) {
@@ -508,32 +599,47 @@
         const displayKatex = li.querySelector(':scope > .katex-display');
         const onlyDisplay = displayKatex && li.textContent.trim() === displayKatex.textContent.trim();
         const key = ordered ? 'numbered_list_item' : 'bulleted_list_item';
+        const payload = () => ({ rich_text: [rtText('')] });
         if (onlyDisplay) {
           const tex = getLatexFromKatex(displayKatex);
-          blocks.push({
-            type: key,
-            [key]: { rich_text: [rtText('')] },
-            children: [{ type: 'equation', equation: { expression: tex } }]
-          });
+          const data = payload();
+          data.children = [{ object: 'block', type: 'equation', equation: { expression: tex } }];
+          target.push({ object: 'block', type: key, [key]: data });
           return;
         }
+        const checkbox = li.querySelector('input[type="checkbox"]');
         let rich = parseInline(li);
         rich = compactRich(rich);
-        if (isEmptyRich(rich)) return; // 跳过空列表项
-        blocks.push({ type: key, [key]: { rich_text: rich } });
+        const childLists = [];
+        Array.from(li.children).forEach(child => {
+          if (child.tagName === 'UL') pushList(child, false, childLists);
+          else if (child.tagName === 'OL') pushList(child, true, childLists);
+        });
+        if (isEmptyRich(rich) && !childLists.length) return; // 跳过空列表项
+        const blockKey = checkbox && checkbox.closest('li') === li ? 'to_do' : key;
+        const blockPayloadKey = blockKey === 'to_do' ? 'to_do' : key;
+        const blockRich = isEmptyRich(rich) ? [rtText('')] : rich;
+        const payloadData = {
+          rich_text: blockRich,
+          ...(blockKey === 'to_do' ? { checked: !!checkbox?.checked } : {}),
+        };
+        if (childLists.length) {
+          payloadData.children = childLists.map(child => child.object ? child : { ...child, object: 'block' });
+        }
+        target.push({ object: 'block', type: blockKey, [blockPayloadKey]: payloadData });
       });
     }
 
-    function pushQuote(el) { const rich = parseInline(el); blocks.push({ type: 'quote', quote: { rich_text: rich } }); }
+    function pushQuote(el, target = blocks) { const rich = parseInline(el); target.push({ object: 'block', type: 'quote', quote: { rich_text: rich } }); }
 
-    function pushParagraphOrEquation(el) {
+    function pushParagraphOrEquation(el, target = blocks) {
       const display = el.querySelector(':scope > .katex-display');
       if (display && el.textContent.trim() === display.textContent.trim()) {
         const tex = getLatexFromKatex(display);
-        blocks.push({ type: 'equation', equation: { expression: tex } });
+        target.push({ object: 'block', type: 'equation', equation: { expression: tex } });
       } else {
         const rich = parseInline(el);
-        pushParagraphRich(rich);
+        pushParagraphRich(rich, target);
       }
     }
 
@@ -547,9 +653,9 @@
       if (tag === 'UL') { pushList(el, false); return; }
       if (tag === 'OL') { pushList(el, true); return; }
       if (tag === 'BLOCKQUOTE') { pushQuote(el); return; }
-      if (tag === 'HR') { blocks.push({ type: 'divider', divider: {} }); return; }
-      if (el.classList.contains('katex-display')) { const tex = getLatexFromKatex(el); blocks.push({ type: 'equation', equation: { expression: tex } }); return; }
-      if (tag === 'TABLE') { const md = tableToMarkdown(el); blocks.push({ type: 'code', code: { language: 'markdown', rich_text: [rtText(md)] } }); return; }
+      if (tag === 'HR') { blocks.push({ object: 'block', type: 'divider', divider: {} }); return; }
+      if (el.classList.contains('katex-display')) { const tex = getLatexFromKatex(el); blocks.push({ object: 'block', type: 'equation', equation: { expression: tex } }); return; }
+      if (tag === 'TABLE') { const md = tableToMarkdown(el); blocks.push({ object: 'block', type: 'code', code: { language: 'markdown', rich_text: [rtText(md)] } }); return; }
       pushParagraphRich(parseInline(el));
     }
 
