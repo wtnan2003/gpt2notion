@@ -120,6 +120,25 @@
     });
   }
 
+  const NOTION_CHILD_LIMIT = 100;
+
+  function chunkChildren(children, size = NOTION_CHILD_LIMIT) {
+    const arr = Array.isArray(children) ? children : [];
+    const chunks = [];
+    for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+    return chunks;
+  }
+
+  async function appendChildren(targetId, children) {
+    const chunks = chunkChildren(children);
+    let lastRes = null;
+    for (const chunk of chunks) {
+      if (!chunk.length) continue;
+      lastRes = await notionRequest({ method: 'PATCH', url: `/blocks/${targetId}/children`, data: { children: chunk } });
+    }
+    return lastRes;
+  }
+
   async function createPageWithBlocks(title, children) {
     const cfg = getConfig();
     if (!cfg.token) throw new Error('未配置 Notion Token');
@@ -132,18 +151,21 @@
     if (cfg.preferCreateNewPage) {
       if (!parentId) throw new Error('未配置父级 ID（页面或数据库）');
       const parent = cfg.parentIsDatabase ? { database_id: parentId } : { page_id: parentId };
+      const chunks = chunkChildren(children);
+      const firstChunk = chunks.length ? chunks.shift() : [];
       const payload = {
         parent,
         properties: cfg.parentIsDatabase
           ? undefined
           : { title: { title: [{ type: 'text', text: { content: title } }] } },
-        children,
       };
+      if (firstChunk.length) payload.children = firstChunk;
       const page = await notionRequest({ method: 'POST', url: '/pages', data: payload });
+      if (page?.id && chunks.length) await appendChildren(page.id, chunks.flat());
       return page;
     } else {
       if (!appendId) throw new Error('未配置“追加到页面/块 ID”');
-      const res = await notionRequest({ method: 'PATCH', url: `/blocks/${appendId}/children`, data: { children } }).catch(e => {
+      const res = await appendChildren(appendId, children).catch(e => {
         if (/database/i.test(String(e))) throw new Error('“追加到”目标看起来像数据库 ID。请改用“创建新页面”并将父级设置为该数据库。');
         throw e;
       });
@@ -703,3 +725,4 @@
   })();
 
 })();
+ 
