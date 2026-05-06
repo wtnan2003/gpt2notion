@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT → Notion（保留公式｜数据库支持｜修复列表与代码语言｜按钮置底不显设置）
 // @namespace    https://github.com/wtnan2003/gpt2notion
-// @version      1.2.1
+// @version      1.2.9
 // @description  将 ChatGPT 回答复制/推送到 Notion，并保留 LaTeX；支持父级为 Page/Database；自动修正代码语言别名；避免列表空圆点；按钮位于回答底部且隐藏设置按钮（通过 Tampermonkey 菜单打开设置）。
 // @author       you
 // @match        https://chat.openai.com/*
@@ -12,6 +12,7 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
 // @connect      api.notion.com
+// @run-at       document-idle
 // ==/UserScript==
 
 (function () {
@@ -174,15 +175,163 @@
   }
 
   // ===== DOM 选择器适配 =====
+  const MESSAGE_TURN_SELECTOR = '[data-testid^="conversation-turn-"]';
+  const ASSISTANT_ROLE_SELECTOR = '[data-message-author-role="assistant"]';
+
+  function uniqueElements(nodes) {
+    return Array.from(new Set(Array.from(nodes).filter(Boolean)));
+  }
+
+  function isAssistantMessageNode(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
+    const el = /** @type {HTMLElement} */(node);
+    if (el.matches(ASSISTANT_ROLE_SELECTOR)) return true;
+    const roleNode = el.querySelector(ASSISTANT_ROLE_SELECTOR);
+    if (roleNode) return true;
+    return !!el.querySelector('.markdown, .deep-research-result');
+  }
+
+  function findMessageNode(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return null;
+    const el = /** @type {HTMLElement} */(node);
+    return el.closest(MESSAGE_TURN_SELECTOR) ||
+      el.closest('article') ||
+      el.closest('[data-message-id]') ||
+      el.closest(ASSISTANT_ROLE_SELECTOR) ||
+      el;
+  }
+
+  function getMessageContentRoot(msgNode) {
+    return getMessageContentRoots(msgNode)[0] || msgNode;
+  }
+
+  function getMessageContentRoots(msgNode) {
+    if (!msgNode) return null;
+    const roleRoot = msgNode.matches?.(ASSISTANT_ROLE_SELECTOR)
+      ? msgNode
+      : msgNode.querySelector?.(ASSISTANT_ROLE_SELECTOR);
+    const scope = roleRoot || msgNode;
+    const roots = uniqueElements([
+      ...Array.from(scope.querySelectorAll?.('.deep-research-result, .markdown') || []),
+      ...Array.from(msgNode.querySelectorAll?.('.deep-research-result, .markdown') || []),
+    ]).filter(el => !el.closest('.tm-export-bar'));
+    const topRoots = roots.filter(el => !roots.some(other => other !== el && other.contains(el)));
+    return topRoots.length ? topRoots : [scope];
+  }
+
+  function isContentBlockElement(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    const tag = el.tagName;
+    if (isCodeBlockElement(el)) return true;
+    return /^H[1-6]$/.test(tag) ||
+      ['P', 'UL', 'OL', 'BLOCKQUOTE', 'HR', 'TABLE'].includes(tag) ||
+      el.classList.contains('katex-display');
+  }
+
+  function isCodeBlockElement(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    const tag = el.tagName;
+    if (tag === 'PRE') return true;
+    if (tag === 'CODE') {
+      const parentTag = el.parentElement?.tagName || '';
+      return parentTag !== 'P' && getVisibleText(el).includes('\n');
+    }
+    if (tag !== 'DIV') return false;
+    if (el.matches('[data-message-code-block], [data-testid*="code"], [class*="code-block"]')) return true;
+    const code = el.querySelector(':scope code');
+    if (!code) return false;
+    const text = getVisibleText(code);
+    return text.includes('\n') || !!el.querySelector('button, [data-language], [class*="language-"]');
+  }
+
+  function getVisibleText(el) {
+    if (!el) return '';
+    const inner = typeof el.innerText === 'string' ? el.innerText : '';
+    const raw = inner || el.textContent || '';
+    return raw.replace(/\r\n?/g, '\n').replace(/\u00A0/g, ' ');
+  }
+
+  function isKnownCodeLanguage(lang) {
+    if (!lang) return false;
+    const mapped = mapToNotionLang(lang);
+    return mapped && mapped !== 'plain text';
+  }
+
+  function cleanLanguageLabel(label) {
+    return String(label || '')
+      .trim()
+      .replace(/^language[-:\s]*/i, '')
+      .replace(/\s+code$/i, '')
+      .trim();
+  }
+
+  function inferCodeLanguageFromContainer(el, code) {
+    const attrCandidates = [
+      code?.getAttribute('data-language'),
+      code?.getAttribute('data-lang'),
+      el.getAttribute?.('data-language'),
+      el.getAttribute?.('data-lang'),
+      el.querySelector?.('[data-language]')?.getAttribute('data-language'),
+      el.querySelector?.('[data-lang]')?.getAttribute('data-lang'),
+    ].map(cleanLanguageLabel);
+    const attrLang = attrCandidates.find(isKnownCodeLanguage);
+    if (attrLang) return attrLang;
+
+    const ignored = new Set(['copy', 'copy code', 'copied', '复制', '复制代码', '已复制', 'run', 'download']);
+    const labelNodes = Array.from(el.querySelectorAll?.('span, div, figcaption') || []);
+    for (const node of labelNodes) {
+      if (node === code || node.contains(code) || node.closest('button')) continue;
+      const label = cleanLanguageLabel(getVisibleText(node));
+      if (!label || label.length > 32 || label.includes('\n')) continue;
+      if (ignored.has(label.toLowerCase())) continue;
+      const firstToken = cleanLanguageLabel(label.split(/\s+/)[0]);
+      if (isKnownCodeLanguage(label)) return label;
+      if (isKnownCodeLanguage(firstToken)) return firstToken;
+    }
+    return '';
+  }
+
+  function getCodeInfo(el) {
+    const code = el.querySelector?.('code') || (el.tagName === 'CODE' ? el : null);
+    const cls = Array.from(code?.classList || []);
+    const fromClass = cls.find(c => c.startsWith('language-'))?.replace('language-', '') || '';
+    const lang = fromClass ||
+      code?.getAttribute('data-language') ||
+      code?.getAttribute('data-lang') ||
+      el.getAttribute?.('data-language') ||
+      el.getAttribute?.('data-lang') ||
+      el.querySelector?.('[data-language]')?.getAttribute('data-language') ||
+      el.querySelector?.('[data-lang]')?.getAttribute('data-lang') ||
+      inferCodeLanguageFromContainer(el, code) ||
+      '';
+    const textFromCode = code ? getVisibleText(code) : '';
+    const text = textFromCode || getVisibleText(el);
+    return { lang: cleanLanguageLabel(lang), text: text.replace(/\n$/, '') };
+  }
+
+  function collectContentBlocks(root) {
+    const out = [];
+    function walk(node) {
+      if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
+      const el = /** @type {HTMLElement} */(node);
+      if (el.closest('.tm-export-bar')) return;
+      if (isContentBlockElement(el)) {
+        out.push(el);
+        return;
+      }
+      Array.from(el.children).forEach(walk);
+    }
+    Array.from(root.children || []).forEach(walk);
+    return out;
+  }
+
   function getAssistantMessageNodes() {
-    const candidates = [
-      'div[data-message-author-role="assistant"]',
-      'article:has(.markdown)',
-      '.markdown:not(article .markdown)'
-    ];
     const set = new Set();
-    candidates.forEach(sel => document.querySelectorAll(sel).forEach(n => set.add(n.closest('div, article') || n)));
-    return Array.from(set).filter(Boolean);
+    document.querySelectorAll(`${MESSAGE_TURN_SELECTOR}, ${ASSISTANT_ROLE_SELECTOR}, .markdown, .deep-research-result`).forEach(node => {
+      const msgNode = findMessageNode(node);
+      if (msgNode && isAssistantMessageNode(msgNode)) set.add(msgNode);
+    });
+    return uniqueElements(set);
   }
 
   function ensureBar(msgNode) {
@@ -229,8 +378,8 @@
     bar.appendChild(btnCopy);
     bar.appendChild(btnNotion);
 
-    // 插入位置：回答的最底端
-    const target = msgNode.querySelector('.markdown')?.parentElement || msgNode;
+    // 插入位置：使用整条消息容器，避免 ChatGPT 重绘 markdown 内部节点时移除按钮。
+    const target = msgNode;
     target.appendChild(bar);
   }
 
@@ -283,7 +432,7 @@
   // ====== 复制为 Markdown（保留 $ 与 $$） ======
   function serializeToMarkdown(msgNode) {
     const mdLines = [];
-    const root = msgNode.querySelector('.markdown') || msgNode;
+    const roots = getMessageContentRoots(msgNode) || [msgNode];
 
     function getLatexFromKatex(el) {
       const ann = el.querySelector('annotation[encoding="application/x-tex"]');
@@ -338,12 +487,10 @@
         mdLines.push('');
         return;
       }
-      if (tag === 'PRE') {
-        const code = el.querySelector('code');
-        const lang = Array.from(code?.classList || []).find(c => c.startsWith('language-'))?.replace('language-', '') || '';
-        const txt = code ? code.textContent : el.textContent;
+      if (isCodeBlockElement(el)) {
+        const { lang, text } = getCodeInfo(el);
         mdLines.push('```' + (lang || ''));
-        mdLines.push((txt || '').replace(/\n$/, ''));
+        mdLines.push(text || '');
         mdLines.push('```');
         mdLines.push('');
         return;
@@ -372,7 +519,14 @@
       mdLines.push('');
     }
 
-    Array.from(root.children).forEach(handleBlock);
+    roots.forEach(root => {
+      const contentBlocks = collectContentBlocks(root);
+      if (contentBlocks.length) contentBlocks.forEach(handleBlock);
+      else if (root.innerText && root.innerText.trim()) {
+        mdLines.push(root.innerText.trim());
+        mdLines.push('');
+      }
+    });
     return mdLines.join('\n').replace(/\n{3,}/g, '\n\n');
   }
 
@@ -418,7 +572,7 @@
 
   // ====== 序列化为 Notion Blocks（保留 inline/display 公式） ======
   function serializeToNotionBlocks(msgNode) {
-    const root = msgNode.querySelector('.markdown') || msgNode;
+    const roots = getMessageContentRoots(msgNode) || [msgNode];
     const blocks = [];
 
     function rtText(content, annotations = {}, link = null) {
@@ -430,6 +584,10 @@
         code: !!annotations.code,
         color: annotations.color || 'default'
       } };
+    }
+
+    function rtCodeText(content) {
+      return { type: 'text', text: { content } };
     }
 
     function rtEq(expression) { return { type: 'equation', equation: { expression } }; }
@@ -583,18 +741,9 @@
     }
 
     function pushCode(el, target = blocks) {
-      const code = el.querySelector('code');
-      let lang = '';
-      if (code) {
-        const cls = Array.from(code.classList || []);
-        const fromClass = cls.find(c => c.startsWith('language-'))?.replace('language-', '');
-        const dataLang = code.getAttribute('data-language') || el.getAttribute('data-language');
-        lang = fromClass || dataLang || '';
-      }
-      lang = mapToNotionLang(lang) || 'plain text';
-
-      const txt = code ? code.textContent : el.textContent;
-      target.push({ object: 'block', type: 'code', code: { language: lang, rich_text: [rtText(txt)] } });
+      const info = getCodeInfo(el);
+      const lang = mapToNotionLang(info.lang) || 'plain text';
+      target.push({ object: 'block', type: 'code', code: { caption: [], rich_text: [rtCodeText(info.text)], language: lang } });
     }
 
     function pushList(el, ordered = false, target = blocks) {
@@ -671,7 +820,7 @@
       const tag = el.tagName;
       if (/^H[1-3]$/.test(tag)) { pushHeading(parseInt(tag.substring(1), 10), el); return; }
       if (tag === 'P') { pushParagraphOrEquation(el); return; }
-      if (tag === 'PRE') { pushCode(el); return; }
+      if (isCodeBlockElement(el)) { pushCode(el); return; }
       if (tag === 'UL') { pushList(el, false); return; }
       if (tag === 'OL') { pushList(el, true); return; }
       if (tag === 'BLOCKQUOTE') { pushQuote(el); return; }
@@ -681,16 +830,20 @@
       pushParagraphRich(parseInline(el));
     }
 
-    const container = root;
-    Array.from(container.children).forEach(handleBlock);
-    if (blocks.length === 0) pushParagraphRich([rtText(root.innerText || '')]);
+    roots.forEach(root => {
+      const contentBlocks = collectContentBlocks(root);
+      if (contentBlocks.length) contentBlocks.forEach(handleBlock);
+      else if (root.innerText && root.innerText.trim()) pushParagraphRich([rtText(root.innerText.trim())]);
+    });
+    if (blocks.length === 0) pushParagraphRich([rtText(roots.map(root => root.innerText || '').join('\n\n').trim())]);
     return blocks;
   }
 
   function extractFirstHeadingText(msgNode) {
-    const hd = (msgNode.querySelector('.markdown h1, .markdown h2, .markdown h3') || {}).textContent;
+    const root = getMessageContentRoot(msgNode) || msgNode;
+    const hd = (root.querySelector('h1, h2, h3') || {}).textContent;
     if (hd && hd.trim()) return hd.trim().slice(0, 100);
-    const p = (msgNode.querySelector('.markdown p') || {}).innerText || '';
+    const p = (root.querySelector('p') || {}).innerText || root.innerText || '';
     return p.trim().slice(0, 60);
   }
 
@@ -708,14 +861,22 @@
 
   // ===== 观察器：为每条助手消息插入按钮 =====
   function mountObserver() {
+    let timer = null;
     const injectAll = () => getAssistantMessageNodes().forEach(ensureBar);
+    const scheduleInject = () => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        injectAll();
+      }, 250);
+    };
     injectAll();
-    const obs = new MutationObserver(() => injectAll());
+    const obs = new MutationObserver(() => scheduleInject());
     obs.observe(document.body, { childList: true, subtree: true });
+    setInterval(injectAll, 3000);
   }
 
   (async function init() {
-    GM_registerMenuCommand('Notion 设置', openConfigPanel);
     for (let i = 0; i < 50; i++) {
       if (getAssistantMessageNodes().length) break;
       await sleep(200);
