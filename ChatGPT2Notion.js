@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT → Notion（保留公式｜数据库支持｜修复列表与代码语言｜按钮置底不显设置）
 // @namespace    https://github.com/wtnan2003/gpt2notion
-// @version      1.2.9
+// @version      1.2.10
 // @description  将 ChatGPT 回答复制/推送到 Notion，并保留 LaTeX；支持父级为 Page/Database；自动修正代码语言别名；避免列表空圆点；按钮位于回答底部且隐藏设置按钮（通过 Tampermonkey 菜单打开设置）。
 // @author       you
 // @match        https://chat.openai.com/*
@@ -515,6 +515,11 @@
         mdLines.push('');
         return;
       }
+      if (tag === 'TABLE') {
+        mdLines.push(tableToMarkdown(el));
+        mdLines.push('');
+        return;
+      }
       mdLines.push(textFromNode(el));
       mdLines.push('');
     }
@@ -803,6 +808,29 @@
 
     function pushQuote(el, target = blocks) { const rich = parseInline(el); target.push({ object: 'block', type: 'quote', quote: { rich_text: rich } }); }
 
+    function pushTable(el, target = blocks) {
+      const rows = tableToRows(el, cell => {
+        const rich = parseInline(cell);
+        return rich.length ? rich : [];
+      });
+      if (!rows.cells.length || !rows.width) return;
+      const tableRows = rows.cells.map(row => ({
+        object: 'block',
+        type: 'table_row',
+        table_row: { cells: row },
+      }));
+      target.push({
+        object: 'block',
+        type: 'table',
+        table: {
+          table_width: rows.width,
+          has_column_header: rows.hasColumnHeader,
+          has_row_header: false,
+          children: tableRows,
+        },
+      });
+    }
+
     function pushParagraphOrEquation(el, target = blocks) {
       const display = el.querySelector(':scope > .katex-display');
       if (display && el.textContent.trim() === display.textContent.trim()) {
@@ -826,7 +854,7 @@
       if (tag === 'BLOCKQUOTE') { pushQuote(el); return; }
       if (tag === 'HR') { blocks.push({ object: 'block', type: 'divider', divider: {} }); return; }
       if (el.classList.contains('katex-display')) { const tex = getLatexFromKatex(el); blocks.push({ object: 'block', type: 'equation', equation: { expression: tex } }); return; }
-      if (tag === 'TABLE') { const md = tableToMarkdown(el); blocks.push({ object: 'block', type: 'code', code: { language: 'markdown', rich_text: [rtText(md)] } }); return; }
+      if (tag === 'TABLE') { pushTable(el); return; }
       pushParagraphRich(parseInline(el));
     }
 
@@ -848,15 +876,30 @@
   }
 
   function tableToMarkdown(tableEl) {
-    function rowToArr(tr) { return Array.from(tr.children).map(td => td.innerText.replace(/\|/g, '\\|').trim()); }
-    const rows = Array.from(tableEl.querySelectorAll('tr')).map(rowToArr);
-    if (!rows.length) return '';
-    const head = rows[0];
+    const rows = tableToRows(tableEl, cell => getVisibleText(cell).replace(/\|/g, '\\|').trim());
+    if (!rows.cells.length) return '';
+    const head = rows.cells[0];
     const sep = head.map(() => '---');
-    const body = rows.slice(1);
+    const body = rows.cells.slice(1);
     const lines = [ `| ${head.join(' | ')} |`, `| ${sep.join(' | ')} |` ];
     body.forEach(r => lines.push(`| ${r.join(' | ')} |`));
     return lines.join('\n');
+  }
+
+  function tableToRows(tableEl, cellMapper) {
+    const trs = Array.from(tableEl.querySelectorAll('tr'));
+    const rawRows = trs.map(tr => Array.from(tr.children).filter(cell => ['TH', 'TD'].includes(cell.tagName)));
+    const width = rawRows.reduce((max, row) => Math.max(max, row.length), 0);
+    const cells = rawRows
+      .filter(row => row.length)
+      .map(row => {
+        const mapped = row.map(cellMapper);
+        while (mapped.length < width) mapped.push(typeof mapped[0] === 'string' ? '' : []);
+        return mapped;
+      });
+    const firstRow = rawRows[0] || [];
+    const hasColumnHeader = !!tableEl.querySelector('thead') || firstRow.some(cell => cell.tagName === 'TH');
+    return { cells, width, hasColumnHeader };
   }
 
   // ===== 观察器：为每条助手消息插入按钮 =====
