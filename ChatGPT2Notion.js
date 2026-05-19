@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT → Notion（保留公式｜数据库支持｜修复列表与代码语言｜按钮置底不显设置）
 // @namespace    https://github.com/wtnan2003/gpt2notion
-// @version      1.2.10
-// @description  将 ChatGPT 回答复制/推送到 Notion，并保留 LaTeX；支持父级为 Page/Database；自动修正代码语言别名；避免列表空圆点；按钮位于回答底部且隐藏设置按钮（通过 Tampermonkey 菜单打开设置）。
+// @version      1.2.12
+// @description  将 ChatGPT 回答复制/推送到 Notion，并保留 LaTeX；支持父级为 Page/Database；修复列表、代码语言与 Markdown 管道表格识别。
 // @author       you
 // @match        https://chat.openai.com/*
 // @match        https://chatgpt.com/*
@@ -237,11 +237,20 @@
       return parentTag !== 'P' && getVisibleText(el).includes('\n');
     }
     if (tag !== 'DIV') return false;
+    if (hasContentDescendantOutsideCode(el)) return false;
     if (el.matches('[data-message-code-block], [data-testid*="code"], [class*="code-block"]')) return true;
     const code = el.querySelector(':scope code');
     if (!code) return false;
     const text = getVisibleText(code);
     return text.includes('\n') || !!el.querySelector('button, [data-language], [class*="language-"]');
+  }
+
+  function hasContentDescendantOutsideCode(el) {
+    const selector = 'h1,h2,h3,h4,h5,h6,p,ul,ol,blockquote,hr,table,.katex-display';
+    return Array.from(el.querySelectorAll(selector)).some(node => {
+      if (node === el) return false;
+      return !node.closest('pre, code');
+    });
   }
 
   function getVisibleText(el) {
@@ -475,6 +484,12 @@
         return;
       }
       if (tag === 'P') {
+        const markdownTable = parseMarkdownTable(getVisibleText(el));
+        if (markdownTable) {
+          mdLines.push(markdownTableToMarkdown(markdownTable));
+          mdLines.push('');
+          return;
+        }
         const displayKatex = el.querySelector('.katex-display');
         if (displayKatex && el.textContent.trim() === displayKatex.textContent.trim()) {
           const tex = displayKatex.querySelector('annotation[encoding="application/x-tex"]').textContent;
@@ -489,9 +504,14 @@
       }
       if (isCodeBlockElement(el)) {
         const { lang, text } = getCodeInfo(el);
-        mdLines.push('```' + (lang || ''));
-        mdLines.push(text || '');
-        mdLines.push('```');
+        const markdownTable = parseMarkdownTable(text || '');
+        if (markdownTable) {
+          mdLines.push(markdownTableToMarkdown(markdownTable));
+        } else {
+          mdLines.push('```' + (lang || ''));
+          mdLines.push(text || '');
+          mdLines.push('```');
+        }
         mdLines.push('');
         return;
       }
@@ -747,6 +767,11 @@
 
     function pushCode(el, target = blocks) {
       const info = getCodeInfo(el);
+      const markdownTable = parseMarkdownTable(info.text || '');
+      if (markdownTable) {
+        pushMarkdownTable(markdownTable, target);
+        return;
+      }
       const lang = mapToNotionLang(info.lang) || 'plain text';
       target.push({ object: 'block', type: 'code', code: { caption: [], rich_text: [rtCodeText(info.text)], language: lang } });
     }
@@ -831,12 +856,35 @@
       });
     }
 
+    function pushMarkdownTable(table, target = blocks) {
+      const tableRows = table.cells.map(row => ({
+        object: 'block',
+        type: 'table_row',
+        table_row: { cells: row.map(cell => markdownInlineToRichText(cell, rtText)) },
+      }));
+      target.push({
+        object: 'block',
+        type: 'table',
+        table: {
+          table_width: table.width,
+          has_column_header: true,
+          has_row_header: false,
+          children: tableRows,
+        },
+      });
+    }
+
     function pushParagraphOrEquation(el, target = blocks) {
       const display = el.querySelector(':scope > .katex-display');
       if (display && el.textContent.trim() === display.textContent.trim()) {
         const tex = getLatexFromKatex(display);
         target.push({ object: 'block', type: 'equation', equation: { expression: tex } });
       } else {
+        const markdownTable = parseMarkdownTable(getVisibleText(el));
+        if (markdownTable) {
+          pushMarkdownTable(markdownTable, target);
+          return;
+        }
         const rich = parseInline(el);
         pushParagraphRich(rich, target);
       }
@@ -900,6 +948,100 @@
     const firstRow = rawRows[0] || [];
     const hasColumnHeader = !!tableEl.querySelector('thead') || firstRow.some(cell => cell.tagName === 'TH');
     return { cells, width, hasColumnHeader };
+  }
+
+  function splitMarkdownTableLine(line) {
+    let s = String(line || '').trim();
+    if (!s.includes('|')) return [];
+    if (s.startsWith('|')) s = s.slice(1);
+    if (s.endsWith('|')) s = s.slice(0, -1);
+    const cells = [];
+    let cell = '';
+    let escaped = false;
+    let backticks = 0;
+    for (const ch of s) {
+      if (escaped) {
+        cell += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch === '`') {
+        backticks = backticks ? 0 : 1;
+        cell += ch;
+        continue;
+      }
+      if (ch === '|' && !backticks) {
+        cells.push(cell.trim());
+        cell = '';
+        continue;
+      }
+      cell += ch;
+    }
+    cells.push(cell.trim());
+    return cells;
+  }
+
+  function isMarkdownTableSeparator(line) {
+    const cells = splitMarkdownTableLine(line);
+    return cells.length > 1 && cells.every(cell => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, '')));
+  }
+
+  function normalizeMarkdownTableRows(rows, width) {
+    return rows.map(row => {
+      const cells = row.slice(0, width);
+      while (cells.length < width) cells.push('');
+      return cells;
+    });
+  }
+
+  function parseMarkdownTable(text) {
+    const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
+    for (let i = 0; i < lines.length - 1; i++) {
+      const header = splitMarkdownTableLine(lines[i]);
+      if (header.length < 2 || !isMarkdownTableSeparator(lines[i + 1])) continue;
+      const width = header.length;
+      const rows = [header];
+      for (let j = i + 2; j < lines.length; j++) {
+        const row = splitMarkdownTableLine(lines[j]);
+        if (row.length < 2) break;
+        rows.push(row);
+      }
+      if (rows.length > 1) return { cells: normalizeMarkdownTableRows(rows, width), width, hasColumnHeader: true };
+    }
+    return null;
+  }
+
+  function markdownTableToMarkdown(table) {
+    if (!table || !table.cells?.length) return '';
+    const head = table.cells[0].map(cell => String(cell).replace(/\|/g, '\\|'));
+    const sep = head.map(() => '---');
+    const lines = [`| ${head.join(' | ')} |`, `| ${sep.join(' | ')} |`];
+    table.cells.slice(1).forEach(row => lines.push(`| ${row.map(cell => String(cell).replace(/\|/g, '\\|')).join(' | ')} |`));
+    return lines.join('\n');
+  }
+
+  function markdownInlineToRichText(text, rtText) {
+    const out = [];
+    const s = String(text || '');
+    const re = /(\*\*([^*]+)\*\*|`([^`]+)`|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\))/g;
+    let lastIndex = 0;
+    let match;
+    const push = (content, annotations = {}, link = null) => {
+      if (content) out.push(rtText(content, annotations, link));
+    };
+    while ((match = re.exec(s))) {
+      push(s.slice(lastIndex, match.index));
+      if (match[2]) push(match[2], { bold: true });
+      else if (match[3]) push(match[3], { code: true });
+      else if (match[4]) push(match[4], {}, match[5]);
+      lastIndex = re.lastIndex;
+    }
+    push(s.slice(lastIndex));
+    return out.length ? out : [rtText('')];
   }
 
   // ===== 观察器：为每条助手消息插入按钮 =====
